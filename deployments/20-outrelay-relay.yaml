@@ -1,0 +1,105 @@
+# Relay: stateless QUIC intermediary between agents.
+#
+# Listens on UDP/7443 with mTLS via the dev-pki Secret
+# `outrelay-relay-tls`. Subscribes to controller policy under
+# tenant `acme` (override per environment via --tenant).
+#
+# Replicas default to 2 so a Pod can be killed to demonstrate the
+# stream-resume failover path; drop to 1 for a minimal setup. The
+# K8s Service forwards UDP packets by 5-tuple, so a given agent's
+# QUIC connection consistently lands on the same Pod replica.
+#
+# Build:
+#   docker build -f Dockerfile -t outrelay-relay:dev .
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: outrelay-relay
+  namespace: outrelay
+  labels:
+    app.kubernetes.io/part-of: outrelay
+    app.kubernetes.io/managed-by: outrelay
+    app.kubernetes.io/component: relay
+spec:
+  type: ClusterIP
+  selector:
+    app.kubernetes.io/part-of: outrelay
+    app.kubernetes.io/component: relay
+  ports:
+    - name: orp
+      port: 7443
+      targetPort: 7443
+      protocol: UDP
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: outrelay-relay
+  namespace: outrelay
+  labels:
+    app.kubernetes.io/part-of: outrelay
+    app.kubernetes.io/managed-by: outrelay
+    app.kubernetes.io/component: relay
+spec:
+  # Two replicas so killing one Pod proves the surviving replica
+  # picks up resumed streams. Drop to 1 for a minimal setup.
+  replicas: 2
+  selector:
+    matchLabels:
+      app.kubernetes.io/part-of: outrelay
+      app.kubernetes.io/component: relay
+  template:
+    metadata:
+      labels:
+        app.kubernetes.io/part-of: outrelay
+        app.kubernetes.io/managed-by: outrelay
+        app.kubernetes.io/component: relay
+    spec:
+      securityContext:
+        runAsNonRoot: true
+        runAsUser: 65532
+        runAsGroup: 65532
+      containers:
+        - name: relay
+          image: outrelay-relay:dev
+          imagePullPolicy: IfNotPresent
+          args:
+            - --listen=0.0.0.0:7443
+            - --controller=outrelay-controller.outrelay.svc.cluster.local:7444
+            - --cert=/etc/outrelay/tls.crt
+            - --key=/etc/outrelay/tls.key
+            - --ca=/etc/outrelay/ca.crt
+            # relay-id: per-Pod so the controller's UpsertRelay sees
+            # each replica as a distinct row. POD_NAME is mapped via
+            # downward API; --advertise points at the Service so
+            # forwarding peers can reach this replica.
+            - --relay-id=$(POD_NAME)
+            - --advertise=outrelay-relay.outrelay.svc.cluster.local:7443
+            - --tenant=acme
+            - --debug-listen=
+            - --log-format=json
+          env:
+            - name: POD_NAME
+              valueFrom:
+                fieldRef:
+                  fieldPath: metadata.name
+          ports:
+            - name: orp
+              containerPort: 7443
+              protocol: UDP
+          volumeMounts:
+            - name: tls
+              mountPath: /etc/outrelay
+              readOnly: true
+          resources:
+            requests:
+              cpu: 50m
+              memory: 64Mi
+            limits:
+              cpu: 1
+              memory: 512Mi
+      volumes:
+        - name: tls
+          secret:
+            secretName: outrelay-relay-tls

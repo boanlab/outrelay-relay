@@ -4,10 +4,12 @@
 # `outrelay-relay-tls`. Subscribes to controller policy under
 # tenant `acme` (override per environment via --tenant).
 #
-# Replicas default to 2 so a Pod can be killed to demonstrate the
-# stream-resume failover path; drop to 1 for a minimal setup. The
-# K8s Service forwards UDP packets by 5-tuple, so a given agent's
-# QUIC connection consistently lands on the same Pod replica.
+# Single replica by default. The K8s Service forwards UDP packets
+# by 5-tuple so a given agent's QUIC connection lands consistently
+# on the same Pod, but inter-relay forwarding (pkg/intra) is not
+# wired in this manifest set, so streams between two agents must
+# hit the same replica. Bumping replicas without wiring intra is
+# only useful for exercising the stream-resume path.
 #
 # Build:
 #   docker build -f Dockerfile -t outrelay-relay:dev .
@@ -42,9 +44,10 @@ metadata:
     app.kubernetes.io/managed-by: outrelay
     app.kubernetes.io/component: relay
 spec:
-  # Two replicas so killing one Pod proves the surviving replica
-  # picks up resumed streams. Drop to 1 for a minimal setup.
-  replicas: 2
+  # Default 1 for the local-cluster smoke (no inter-relay pool wired
+  # in this manifest set, so streams must land on the same Pod for
+  # both ends). For multi-relay HA, wire pkg/intra.Pool and bump.
+  replicas: 1
   selector:
     matchLabels:
       app.kubernetes.io/part-of: outrelay
@@ -62,8 +65,8 @@ spec:
         runAsGroup: 65532
       containers:
         - name: relay
-          image: outrelay-relay:dev
-          imagePullPolicy: IfNotPresent
+          image: docker.io/library/outrelay-relay:dev
+          imagePullPolicy: Never
           args:
             - --listen=0.0.0.0:7443
             - --controller=outrelay-controller.outrelay.svc.cluster.local:7444

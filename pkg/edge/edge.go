@@ -14,11 +14,14 @@ import (
 	"crypto/tls"
 	"errors"
 	"fmt"
+	"io"
 	"log/slog"
 	"net"
 	"strconv"
 	"sync"
 	"time"
+
+	"google.golang.org/protobuf/proto"
 
 	pbcontrol "github.com/boanlab/OutRelay/lib/control/v1"
 	"github.com/boanlab/OutRelay/lib/identity"
@@ -29,6 +32,7 @@ import (
 	"github.com/boanlab/OutRelay/lib/transport"
 
 	"github.com/boanlab/outrelay-relay/pkg/audit"
+	"github.com/boanlab/outrelay-relay/pkg/forward"
 	"github.com/boanlab/outrelay-relay/pkg/intra"
 	"github.com/boanlab/outrelay-relay/pkg/policy"
 	"github.com/boanlab/outrelay-relay/pkg/registry"
@@ -44,6 +48,7 @@ type Server struct {
 	cache      *policy.Cache
 	audit      *audit.Emitter
 	pool       *intra.Pool
+	forward    *forward.Plane // nil disables relay_mode=FORWARD
 	metrics    *relayMetrics
 	resumer    *resumeMatcher
 	logger     *slog.Logger
@@ -98,7 +103,7 @@ func newRelayMetrics(reg *observe.Registry) *relayMetrics {
 // New configures (but does not start) a relay server. policyEngine,
 // cache, audit, pool, and obsReg may be nil for tests / single-relay
 // setups.
-func New(listenAddr string, tlsConf *tls.Config, reg *registry.Registry, policyEngine *policy.Engine, cache *policy.Cache, auditEm *audit.Emitter, pool *intra.Pool, obsReg *observe.Registry, logger *slog.Logger) *Server {
+func New(listenAddr string, tlsConf *tls.Config, reg *registry.Registry, policyEngine *policy.Engine, cache *policy.Cache, auditEm *audit.Emitter, pool *intra.Pool, fwd *forward.Plane, obsReg *observe.Registry, logger *slog.Logger) *Server {
 	if logger == nil {
 		logger = slog.Default()
 	}
@@ -110,6 +115,7 @@ func New(listenAddr string, tlsConf *tls.Config, reg *registry.Registry, policyE
 		cache:      cache,
 		audit:      auditEm,
 		pool:       pool,
+		forward:    fwd,
 		metrics:    newRelayMetrics(obsReg),
 		resumer:    newResumeMatcher(),
 		pairs:      map[uint64]streamPair{},
@@ -376,6 +382,7 @@ func (s *Server) handleConsumerStream(ctx context.Context, caller *AgentConn, co
 	// Caller-side policy check first — if the consumer's view denies,
 	// we never bother resolving.
 	var p2pMode policy.P2PMode
+	var relayMode policy.RelayMode
 	if s.policy != nil {
 		dec := s.evaluate(caller.uri, open.TargetService, open.Method)
 		s.recordAudit(caller.uri, open.TargetService, open.Method, dec)
@@ -386,6 +393,7 @@ func (s *Server) handleConsumerStream(ctx context.Context, caller *AgentConn, co
 			return
 		}
 		p2pMode = dec.P2PMode
+		relayMode = dec.RelayMode
 	}
 
 	prov, remote, err := s.reg.Resolve(ctx, caller.uri, open.TargetService)
@@ -472,6 +480,65 @@ func (s *Server) handleConsumerStream(ctx context.Context, caller *AgentConn, co
 		return
 	}
 
+	// relay_mode=FORWARD: skip splice. Allocate a pair of ids on
+	// the mini-TURN forwarding plane and tell each agent (via its
+	// stream-0 ctrl) which allocation it owns and which one to send
+	// to. The data streams are kept open as a liveness signal —
+	// when either side tears down we free the allocations.
+	if relayMode == policy.RelayModeForward && s.forward != nil {
+		provAC, _ := s.reg.LookupAgent(prov.AgentURI()).(*AgentConn)
+		if provAC == nil {
+			_ = orp.WriteFrame(consumerStream, orp.FrameTypeStreamReject, &orpv1.StreamReject{
+				Code: 502, Reason: "forward: provider control channel unavailable",
+			})
+			return
+		}
+		consumerAlloc := s.forward.Allocate()
+		providerAlloc := s.forward.Allocate()
+		defer s.forward.Forget(consumerAlloc)
+		defer s.forward.Forget(providerAlloc)
+
+		fwdEndpoint := s.forward.Endpoint().String()
+		if err := caller.WriteCtrl(orp.FrameTypeAllocGranted, &orpv1.AllocGranted{
+			StreamId:        open.StreamId,
+			MyAllocation:    consumerAlloc,
+			PeerAllocation:  providerAlloc,
+			ForwardEndpoint: fwdEndpoint,
+		}); err != nil {
+			return
+		}
+		if err := provAC.WriteCtrl(orp.FrameTypeAllocGranted, &orpv1.AllocGranted{
+			StreamId:        open.StreamId,
+			MyAllocation:    providerAlloc,
+			PeerAllocation:  consumerAlloc,
+			ForwardEndpoint: fwdEndpoint,
+		}); err != nil {
+			return
+		}
+		// Park: drain both data streams so we exit (and free
+		// allocs) when either side tears down. In forward mode
+		// these streams carry no payload — the data plane is on
+		// UDP via the forwarding plane.
+		done := make(chan struct{}, 2)
+		go func() { _, _ = io.Copy(io.Discard, consumerStream); done <- struct{}{} }()
+		go func() { _, _ = io.Copy(io.Discard, provStream); done <- struct{}{} }()
+		<-done
+		return
+	}
+
+	// Splice mode: notify both agents on their ctrl that the data
+	// plane is up before bytes start flowing. Agents block on
+	// {StreamReady | AllocGranted} after Dial / STREAM_ACCEPT so a
+	// definitive signal here removes any need for a timeout race.
+	// Best-effort — provAC may be nil for non-AgentConn providers
+	// (synthetic registry entries in tests); the smoke and prod
+	// paths always have one.
+	provAC, _ := s.reg.LookupAgent(prov.AgentURI()).(*AgentConn)
+	_ = caller.WriteCtrl(orp.FrameTypeStreamReady, &orpv1.StreamReady{StreamId: open.StreamId})
+	if provAC != nil {
+		_ = provAC.WriteCtrl(orp.FrameTypeStreamReady, &orpv1.StreamReady{StreamId: open.StreamId})
+	}
+
 	_ = splice.Bidirectional(consumerStream, provStream)
 }
 
@@ -493,6 +560,17 @@ type AgentConn struct {
 func (a *AgentConn) AgentURI() string { return a.uri }
 
 func (a *AgentConn) String() string { return a.uri }
+
+// WriteCtrl serialises a single framed proto onto the agent's stream-0
+// control channel under ctrlMu. Used for any relay -> agent ctrl frame
+// originating outside controlLoop's request/response pattern (e.g. an
+// AllocGranted notification from handleConsumerStream once policy
+// resolves to relay_mode=FORWARD).
+func (a *AgentConn) WriteCtrl(typ orp.FrameType, msg proto.Message) error {
+	a.ctrlMu.Lock()
+	defer a.ctrlMu.Unlock()
+	return orp.WriteFrame(a.ctrl, typ, msg)
+}
 
 // OpenIncoming opens a fresh stream toward the provider agent and
 // writes an INCOMING_STREAM frame carrying the consumer's stream_id;

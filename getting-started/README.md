@@ -64,6 +64,8 @@ outrelay-relay \
 | Flag                | Default              | Notes                                                     |
 |---------------------|----------------------|-----------------------------------------------------------|
 | `--listen`          | `127.0.0.1:7443`     | QUIC listen address (UDP).                                |
+| `--listen-tcp`      | `""`                 | Optional TCP+TLS+yamux listener for the UDP-blocked fallback path. Agents enable it with `--relay-tcp`. |
+| `--listen-forward`  | `""`                 | Optional UDP listener for the mini-TURN forwarding plane (`relay_mode=forward`). Empty disables forward mode. |
 | `--controller`      | `127.0.0.1:7444`     | Controller gRPC address. Required.                        |
 | `--cert / --key`    | (required)           | Server cert + key. URI SAN must encode a `relay/<id>` identity. |
 | `--ca`              | (required)           | CA bundle used to verify peer (agent / peer-relay) certs. |
@@ -92,9 +94,11 @@ What happens at startup:
 `deployments/20-outrelay-relay.yaml` is the reference Service +
 Deployment. It runs in the `outrelay` namespace, mounts a
 `outrelay-relay-tls` Secret at `/etc/outrelay`, and dials
-`outrelay-controller.outrelay.svc.cluster.local:7444`. Two replicas
-by default — drop to one for a minimal setup, or kill one Pod to
-exercise the resume path.
+`outrelay-controller.outrelay.svc.cluster.local:7444`. One replica
+by default; bump it to multi-replica to exercise the resume path —
+this manifest does not yet wire `pkg/intra` for inter-relay
+forwarding, so streams between two agents must hit the same
+replica.
 
 The Secret, the controller Service, and the namespace itself are part
 of the OutRelay system bootstrap; see the parent repo for how to wire

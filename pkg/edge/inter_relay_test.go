@@ -153,14 +153,14 @@ func startRelay(t *testing.T, ca *pki.CA, cert *tls.Certificate, ctrl pb.Registr
 		t.Fatal(err)
 	}
 
-	reg := registry.New(ctrl, relayID)
+	reg := registry.New(ctrl, relayID, "")
 	pool := intra.NewPool(&tls.Config{
 		Certificates: []tls.Certificate{*cert},
 		RootCAs:      ca.CertPool(),
 		ServerName:   "localhost",
 		MinVersion:   tls.VersionTLS13,
 	})
-	srv := edge.New(ln.Addr().String(), nil, reg, nil, nil, nil, pool, nil, slog.New(slog.DiscardHandler))
+	srv := edge.New(ln.Addr().String(), nil, reg, nil, nil, nil, pool, nil, nil, slog.New(slog.DiscardHandler))
 	ctx, cancel := context.WithCancel(t.Context())
 	go func() { _ = srv.RunListener(ctx, ln) }()
 	addr := ln.Addr().String()

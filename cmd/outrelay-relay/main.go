@@ -26,6 +26,9 @@ import (
 
 	pb "github.com/boanlab/OutRelay/lib/control/v1"
 	"github.com/boanlab/OutRelay/lib/observe"
+	"github.com/boanlab/OutRelay/lib/transport"
+
+	"github.com/boanlab/outrelay-relay/pkg/forward"
 
 	"github.com/boanlab/outrelay-relay/pkg/audit"
 	"github.com/boanlab/outrelay-relay/pkg/edge"
@@ -40,6 +43,8 @@ var Version = "dev"
 func main() {
 	var (
 		listen          = flag.String("listen", "127.0.0.1:7443", "QUIC listen address")
+		listenTCP       = flag.String("listen-tcp", "", "optional TCP+TLS+yamux listen address (e.g. 0.0.0.0:443) for the UDP-blocked fallback path. Empty disables.")
+		listenForward   = flag.String("listen-forward", "", "optional UDP listen address (e.g. 0.0.0.0:9443) for the mini-TURN data plane (relay_mode=FORWARD). Agents in forward mode send packets here with the peer allocation id as a 4-byte prefix; the relay strips the prefix and forwards. Empty disables forward mode.")
 		certPath        = flag.String("cert", "", "PEM-encoded server cert")
 		keyPath         = flag.String("key", "", "PEM-encoded server key")
 		caPath          = flag.String("ca", "", "PEM-encoded CA bundle for client cert verification")
@@ -105,7 +110,7 @@ func main() {
 	upsertCancel()
 	logger.Info("relay self-registered", "id", id, "controller", *controllerAddr, "version", Version)
 
-	reg := registry.New(ctrl, id)
+	reg := registry.New(ctrl, id, *region)
 
 	var (
 		policyEngine *policy.Engine
@@ -145,7 +150,49 @@ func main() {
 		}()
 	}
 
-	srv := edge.New(*listen, tlsConf, reg, policyEngine, policyCache, auditEm, pool, obsReg, logger)
+	// Optional mini-TURN forwarding plane (relay_mode=FORWARD).
+	// Independent UDP socket from the QUIC listener — the relay
+	// does not terminate QUIC for these flows; it just rewrites
+	// the prefix and forwards the payload to the registered peer.
+	// Constructed before edge.New so the Server can carry the
+	// plane reference and dispatch to it from handleConsumerStream
+	// when policy says forward.
+	var forwardPlane *forward.Plane
+	if *listenForward != "" {
+		fp, err := forward.NewPlane(*listenForward, logger)
+		if err != nil {
+			logger.Error("listen-forward", "addr", *listenForward, "err", err)
+			os.Exit(1)
+		}
+		forwardPlane = fp
+		go func() {
+			logger.Info("relay listening (mini-TURN forward plane)", "addr", fp.Endpoint().String())
+			if err := fp.Run(ctx); err != nil && !errors.Is(err, context.Canceled) {
+				logger.Warn("listen-forward loop exited", "err", err)
+			}
+		}()
+	}
+
+	srv := edge.New(*listen, tlsConf, reg, policyEngine, policyCache, auditEm, pool, forwardPlane, obsReg, logger)
+
+	// Optional TCP+TLS fallback listener for environments that block
+	// UDP. Same Server, same handlers — yamux multiplexes streams
+	// over the TCP connection so each accepted Conn satisfies the
+	// existing transport.Conn interface and plugs straight into
+	// Server.RunListener.
+	if *listenTCP != "" {
+		ln, err := transport.ListenTCP(*listenTCP, tlsConf)
+		if err != nil {
+			logger.Error("listen-tcp", "addr", *listenTCP, "err", err)
+			os.Exit(1)
+		}
+		go func() {
+			logger.Info("relay listening (tcp+tls fallback)", "addr", ln.Addr())
+			if err := srv.RunListener(ctx, ln); err != nil && !errors.Is(err, context.Canceled) {
+				logger.Warn("listen-tcp loop exited", "err", err)
+			}
+		}()
+	}
 
 	if err := srv.Run(ctx); err != nil && !errors.Is(err, context.Canceled) {
 		logger.Error("relay exited", "err", err)

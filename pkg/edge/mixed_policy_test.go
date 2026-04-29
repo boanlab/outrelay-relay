@@ -97,8 +97,8 @@ func TestMixedPolicyStress(t *testing.T) {
 	})
 	cache := policy.NewCache()
 
-	reg := registry.New(ctrlClient, "relay-r")
-	srv := edge.New(ln.Addr().String(), nil, reg, eng, cache, nil, nil, nil, slog.New(slog.DiscardHandler))
+	reg := registry.New(ctrlClient, "relay-r", "")
+	srv := edge.New(ln.Addr().String(), nil, reg, eng, cache, nil, nil, nil, nil, slog.New(slog.DiscardHandler))
 	srvCtx, srvCancel := context.WithCancel(t.Context())
 	defer srvCancel()
 	go func() { _ = srv.RunListener(srvCtx, ln) }()
@@ -277,8 +277,8 @@ func TestMixedPolicyConcurrentAllow(t *testing.T) {
 	})
 	cache := policy.NewCache()
 
-	reg := registry.New(ctrlClient, "relay-r")
-	srv := edge.New(ln.Addr().String(), nil, reg, eng, cache, nil, nil, nil, slog.New(slog.DiscardHandler))
+	reg := registry.New(ctrlClient, "relay-r", "")
+	srv := edge.New(ln.Addr().String(), nil, reg, eng, cache, nil, nil, nil, nil, slog.New(slog.DiscardHandler))
 	srvCtx, srvCancel := context.WithCancel(t.Context())
 	defer srvCancel()
 	go func() { _ = srv.RunListener(srvCtx, ln) }()

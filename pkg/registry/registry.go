@@ -44,6 +44,11 @@ type Stream interface {
 type Registry struct {
 	ctrl    pb.RegistryClient
 	relayID string
+	// region is the relay instance's region label (--region flag).
+	// Passed through to controller.Resolve so multi-region
+	// deployments can prefer same-region providers and avoid an
+	// unnecessary inter-relay hop.
+	region string
 
 	mu         sync.RWMutex
 	agentConns map[string]Provider // agent URI -> conn
@@ -53,10 +58,11 @@ type Registry struct {
 // relayID is the relay instance's identifier (typically its URI SAN);
 // it is sent in every RegisterService / DeregisterAgent call so the
 // controller knows where each provider lives.
-func New(ctrl pb.RegistryClient, relayID string) *Registry {
+func New(ctrl pb.RegistryClient, relayID, region string) *Registry {
 	return &Registry{
 		ctrl:       ctrl,
 		relayID:    relayID,
+		region:     region,
 		agentConns: map[string]Provider{},
 	}
 }
@@ -140,8 +146,9 @@ func (r *Registry) Resolve(ctx context.Context, callerURI, name string) (Provide
 		return nil, nil, fmt.Errorf("registry: cannot extract tenant from %q", callerURI)
 	}
 	resp, err := r.ctrl.Resolve(ctx, &pb.ResolveRequest{
-		Tenant:      tenant,
-		ServiceName: name,
+		Tenant:       tenant,
+		ServiceName:  name,
+		CallerRegion: r.region,
 	})
 	if err != nil {
 		return nil, nil, fmt.Errorf("registry: resolve: %w", err)

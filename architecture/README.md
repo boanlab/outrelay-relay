@@ -52,6 +52,8 @@ relay's behavior is. `edge.Server` holds:
 - the agent registry (delegated to `pkg/registry`),
 - the policy engine and decision cache (delegated to `pkg/policy`),
 - the inter-relay pool (`pkg/intra`),
+- the optional **forwarding plane** (`pkg/forward`), used when
+  policy resolves a stream to `relay_mode=forward`,
 - the **resume matcher** — pairs the two halves of a `STREAM_RESUME`
   so a stream can survive an agent reconnect,
 - the **migrated LRU** — remembers streams that were just promoted to
@@ -60,6 +62,13 @@ relay's behavior is. `edge.Server` holds:
 - a `pairs` map: `stream_id` → `(consumer URI, provider URI)`, the
   routing table for control-plane frames that need to bounce between
   the two ends of a splice (candidate exchange, checkpoints).
+
+After OPEN_STREAM and STREAM_ACCEPT, `edge.Server` sends each agent
+exactly one stream-mode signal on stream-0 ctrl: `STREAM_READY` if
+the policy decision is `relay_mode=splice` (default), or
+`ALLOC_GRANTED` if it is `relay_mode=forward`. The agents branch on
+that signal to either run the splice path (relay-mediated bytes) or
+the forwarding-plane path (relay sees only ciphertext).
 
 Every accepted QUIC connection is dispatched by the URI SAN's role:
 `agent` runs the splice path; `relay` runs the inter-relay forwarding
@@ -89,6 +98,25 @@ peer connection and writes a `FORWARD_STREAM` frame containing the
 target service / method / source-agent URI; the peer relay's reply
 (`STREAM_ACCEPT` / `STREAM_REJECT`) is parsed inline. A failed dial is
 not cached — every `Get` retries.
+
+### `pkg/forward`
+
+The mini-TURN UDP forwarding plane consumed when policy resolves a
+stream to `relay_mode=forward`. `Plane` binds a separate UDP socket
+(opened with `--listen-forward`), assigns monotonic allocation ids,
+and forwards opaque packets between two registered allocations:
+
+- Wire: `[peer_alloc: u32 BE][payload: N]`. `peer_alloc=0` is a
+  registration packet whose payload is `[my_alloc: u32 BE]`.
+- After registration, every datagram with prefix `peer_alloc != 0`
+  is forwarded — payload only — to the registered endpoint.
+- Allocations are released on `Forget`, which `edge.go` calls when
+  the relay-side data streams torn down.
+
+The plane sees only ciphertext; the agents establish their own
+end-to-end QUIC over the forwarded path, so the relay skips QUIC
+encrypt/decrypt on the data plane and is mostly limited by UDP
+copy throughput.
 
 ### `pkg/splice`
 
@@ -120,6 +148,12 @@ the allow/deny verdict. The relay reads it after the decision —
 the relay, `allowed` is the default opportunistic case.
 `CombineP2PModes` merges the caller-side and callee-side rules with
 precedence FORBIDDEN > REQUIRED > ALLOWED.
+
+`RelayMode` (`splice` / `forward`) controls the data path: the
+default is `splice` (the relay terminates QUIC and copies bytes);
+`forward` switches the stream to the mini-TURN forwarding plane
+(`pkg/forward`), where the relay handles only opaque UDP and the
+agents run their own end-to-end QUIC.
 
 ### `pkg/audit`
 

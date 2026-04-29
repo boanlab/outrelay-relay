@@ -2,7 +2,7 @@
 
 Stateless QUIC relay that splices Agent ↔ Agent streams in user space. Part of the [OutRelay](https://github.com/boanlab/OutRelay) platform-agnostic outbound-only relay architecture.
 
-The full architecture, wire protocol, and design rationale live in the controller repo: [`OutRelay/docs/design.md`](https://github.com/boanlab/OutRelay/blob/main/docs/design.md).
+This repo is the relay data plane. The control plane and the shared library live in [`OutRelay`](https://github.com/boanlab/OutRelay) and the per-workload sidecar in [`outrelay-agent`](https://github.com/boanlab/outrelay-agent); see those repos for system-level concerns (PKI, controller, agent identities). The relay-internal walk-throughs live under [`architecture/`](architecture/) and [`getting-started/`](getting-started/).
 
 ## Documentation
 
@@ -18,8 +18,15 @@ pkg/
   edge/               # QUIC accept loop, mTLS, HELLO, control + data stream dispatch.
                       # Hosts the stream-resume matcher (used on agent reconnect),
                       # the P2P-promotion candidate forwarder (OBSERVED_ADDR_QUERY,
-                      # CANDIDATE_OFFER/ANSWER, MIGRATE_TO_P2P/RELAY), and REQUIRED-
-                      # mode promotion enforcement.
+                      # CANDIDATE_OFFER/ANSWER, MIGRATE_TO_P2P/RELAY), REQUIRED-
+                      # mode promotion enforcement, and the per-stream mode
+                      # signalling (StreamReady for splice, AllocGranted for
+                      # relay_mode=forward).
+  forward/            # Mini-TURN UDP forwarding plane (relay_mode=forward). A
+                      # separate UDP listener that strips the 4-byte peer
+                      # allocation prefix and forwards opaque packets between
+                      # registered agents. Skips QUIC encrypt/decrypt on the
+                      # data plane.
   registry/           # facade over the controller's gRPC Registry plus the local
                       # URI → AgentConn map; surfaces ErrProviderRemote when the
                       # provider lives on a peer relay.
@@ -27,7 +34,8 @@ pkg/
                       # and HalfCloser awareness for clean half-close propagation.
   intra/              # inter-relay QUIC connection pool + ForwardStream.
   policy/             # LRU+TTL decision cache, live snapshot watcher, P2PMode
-                      # flow-through (allowed / forbidden / required).
+                      # flow-through (allowed / forbidden / required), and
+                      # RelayMode (splice / forward).
   audit/              # best-effort audit emitter to the controller.
 deployments/          # Kubernetes Service + Deployment manifests (namespace: outrelay).
 ```
@@ -56,6 +64,8 @@ outrelay-relay \
 ```
 
 - `--tenant` enables policy enforcement (closed-world without a snapshot).
+- `--listen-tcp host:port` adds a TCP+TLS+yamux listener for the UDP-blocked fallback path (agents enable it with `--relay-tcp`).
+- `--listen-forward host:port` enables the mini-TURN UDP forwarding plane consumed when policy resolves a stream to `relay_mode=forward`.
 - `--metrics-dump` writes one JSONL line per `--metrics-interval` (default 10 s).
 - `/debug/metrics` and `/debug/pprof` are served on `--debug-listen` (default `127.0.0.1:9100`; pass `""` to disable).
 

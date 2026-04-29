@@ -55,8 +55,8 @@ func TestMigrateToRelayPairsBothHalves(t *testing.T) {
 	defer ln.Close()
 
 	ctrl := startInProcessController(t)
-	reg := registry.New(ctrl, "relay-r")
-	srv := edge.New(ln.Addr().String(), nil, reg, nil, nil, nil, nil, nil, slog.New(slog.DiscardHandler))
+	reg := registry.New(ctrl, "relay-r", "")
+	srv := edge.New(ln.Addr().String(), nil, reg, nil, nil, nil, nil, nil, nil, slog.New(slog.DiscardHandler))
 	srvCtx, srvCancel := context.WithCancel(t.Context())
 	defer srvCancel()
 	go func() { _ = srv.RunListener(srvCtx, ln) }()

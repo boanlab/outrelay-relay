@@ -43,6 +43,26 @@ type Result struct {
 	// post-decision: REQUIRED arms a promotion timer, the other
 	// modes leave the splice as-is.
 	P2PMode P2PMode
+	// RelayMode mirrors the matched rule's relay_mode. SPLICE
+	// (default) keeps the existing data path; FORWARD switches to
+	// the mini-TURN UDP forwarding plane (no QUIC termination on
+	// the relay).
+	RelayMode RelayMode
+}
+
+// RelayMode mirrors control.PolicyRule.relay_mode.
+type RelayMode int
+
+const (
+	RelayModeSplice  RelayMode = 0 // default — full QUIC termination + splice
+	RelayModeForward RelayMode = 1 // mini-TURN: relay forwards UDP, agents do e2e QUIC
+)
+
+func (m RelayMode) String() string {
+	if m == RelayModeForward {
+		return "forward"
+	}
+	return "splice"
 }
 
 // P2PMode mirrors orpv1 / control.PolicyRule p2p_mode.
@@ -92,6 +112,7 @@ type Rule struct {
 	Decision      Decision
 	ExpiresUnixMs int64 // 0 = never
 	P2PMode       P2PMode
+	RelayMode     RelayMode
 }
 
 // Snapshot is an immutable policy index. It is built by the watch
@@ -110,11 +131,11 @@ func (s *Snapshot) Decide(caller, target, method string, now time.Time) Result {
 	nowMs := now.UnixMilli()
 	if rs, ok := s.byTarget[target]; ok {
 		if r := matchFirst(rs, caller, target, method, nowMs); r != nil {
-			return Result{Decision: r.Decision, Reason: r.ID, P2PMode: r.P2PMode}
+			return Result{Decision: r.Decision, Reason: r.ID, P2PMode: r.P2PMode, RelayMode: r.RelayMode}
 		}
 	}
 	if r := matchFirst(s.wildcard, caller, target, method, nowMs); r != nil {
-		return Result{Decision: r.Decision, Reason: r.ID, P2PMode: r.P2PMode}
+		return Result{Decision: r.Decision, Reason: r.ID, P2PMode: r.P2PMode, RelayMode: r.RelayMode}
 	}
 	return Result{Decision: DecisionDeny, Reason: "no matching rule"}
 }
@@ -163,6 +184,7 @@ func FromPB(r *pb.PolicyRule) *Rule {
 		Decision:      decisionFromPB(r.Decision),
 		ExpiresUnixMs: r.ExpiresUnixMs,
 		P2PMode:       p2pModeFromPB(r.P2PMode),
+		RelayMode:     relayModeFromPB(r.RelayMode),
 	}
 }
 
@@ -175,6 +197,13 @@ func p2pModeFromPB(m pb.P2PMode) P2PMode {
 	default:
 		return P2PModeAllowed
 	}
+}
+
+func relayModeFromPB(m pb.RelayMode) RelayMode {
+	if m == pb.RelayMode_RELAY_MODE_FORWARD {
+		return RelayModeForward
+	}
+	return RelayModeSplice
 }
 
 func decisionFromPB(d pb.Decision) Decision {

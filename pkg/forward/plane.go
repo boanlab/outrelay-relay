@@ -41,7 +41,24 @@ import (
 	"net/netip"
 	"sync"
 	"sync/atomic"
+	"time"
 )
+
+// DefaultAllocIdleTTL is the default window an allocation entry may sit
+// without observed activity (no register, no forwarded packet from its
+// agent src) before the GC loop reclaims it. Sized to comfortably
+// outlive a couple of e2e QUIC keepalive intervals — agents that are
+// still healthy will keep their entry warm.
+const DefaultAllocIdleTTL = 60 * time.Second
+
+// allocEntry records where an allocation is registered and when it was
+// last observed as alive. lastSeen is atomic so the data-path forwarder
+// can bump it under RLock; the GC loop takes the full write lock when
+// it actually evicts.
+type allocEntry struct {
+	src      netip.AddrPort
+	lastSeen atomic.Int64 // unix nanos
+}
 
 // Plane is the relay's UDP forwarding plane.
 type Plane struct {
@@ -49,9 +66,11 @@ type Plane struct {
 	logger *slog.Logger
 
 	mu     sync.RWMutex
-	allocs map[uint32]netip.AddrPort // alloc_id -> registered agent UDP endpoint
+	allocs map[uint32]*allocEntry  // alloc_id -> entry
+	src2id map[netip.AddrPort]uint32 // reverse index: agent src -> alloc id (for lastSeen bump)
 
-	nextID atomic.Uint32
+	nextID  atomic.Uint32
+	idleTTL time.Duration // 0 disables the GC loop
 }
 
 // NewPlane binds a UDP socket at addr (e.g. "0.0.0.0:9443") and
@@ -70,15 +89,22 @@ func NewPlane(addr string, logger *slog.Logger) (*Plane, error) {
 		return nil, fmt.Errorf("forward: bind %s: %w", addr, err)
 	}
 	p := &Plane{
-		udp:    conn,
-		logger: logger,
-		allocs: map[uint32]netip.AddrPort{},
+		udp:     conn,
+		logger:  logger,
+		allocs:  map[uint32]*allocEntry{},
+		src2id:  map[netip.AddrPort]uint32{},
+		idleTTL: DefaultAllocIdleTTL,
 	}
 	// nextID starts at 1 (never assign 0 — reserved for the
 	// registration sentinel on the wire).
 	p.nextID.Store(0)
 	return p, nil
 }
+
+// SetIdleTTL overrides the default allocation idle timeout. Pass 0 to
+// disable the GC loop entirely (entries then live until explicit Forget
+// or process exit). Call before Run.
+func (p *Plane) SetIdleTTL(d time.Duration) { p.idleTTL = d }
 
 // Endpoint returns the UDP socket address the plane is bound to.
 // Use this to populate AllocGranted.forward_endpoint.
@@ -106,8 +132,11 @@ func (p *Plane) Allocate() uint32 {
 // stream tears down.
 func (p *Plane) Forget(id uint32) {
 	p.mu.Lock()
-	_, existed := p.allocs[id]
-	delete(p.allocs, id)
+	entry, existed := p.allocs[id]
+	if existed {
+		delete(p.allocs, id)
+		delete(p.src2id, entry.src)
+	}
 	p.mu.Unlock()
 	// `existed=false` after the first Forget is normal when the agent
 	// never sent its registration packet; a second Forget for the same
@@ -121,18 +150,29 @@ func (p *Plane) Forget(id uint32) {
 func (p *Plane) Lookup(id uint32) (netip.AddrPort, bool) {
 	p.mu.RLock()
 	defer p.mu.RUnlock()
-	addr, ok := p.allocs[id]
-	return addr, ok
+	entry, ok := p.allocs[id]
+	if !ok {
+		return netip.AddrPort{}, false
+	}
+	return entry.src, true
 }
 
 // Run drives the forwarding loop until ctx is cancelled or the
 // listener is closed. Errors from individual packets are logged
 // and dropped — the loop never exits on a single bad packet.
+//
+// Also starts the allocation GC loop if idleTTL > 0; the GC reclaims
+// entries whose agent src has not sent a packet within the window,
+// guarding against the leak that would otherwise happen when an
+// agent crashes or migrates without calling Forget on edge.go.
 func (p *Plane) Run(ctx context.Context) error {
 	go func() {
 		<-ctx.Done()
 		_ = p.udp.Close()
 	}()
+	if p.idleTTL > 0 {
+		go p.gcLoop(ctx)
+	}
 	buf := make([]byte, 65536)
 	for {
 		n, srcAP, err := p.udp.ReadFromUDPAddrPort(buf)
@@ -160,17 +200,70 @@ func (p *Plane) Run(ctx context.Context) error {
 			continue
 		}
 		// Data: forward to the registered endpoint, payload only.
+		// Also bump the sender's lastSeen — observing a packet from
+		// srcAP proves the sender is alive, regardless of how its
+		// peer (the forwarding target) is doing. Use the reverse
+		// index so the bump stays O(1).
+		now := time.Now().UnixNano()
 		p.mu.RLock()
-		dst, ok := p.allocs[peerAlloc]
+		entry, ok := p.allocs[peerAlloc]
+		var senderEntry *allocEntry
+		if senderID, srcOk := p.src2id[srcAP]; srcOk {
+			senderEntry = p.allocs[senderID]
+		}
 		p.mu.RUnlock()
+		if senderEntry != nil {
+			senderEntry.lastSeen.Store(now)
+		}
 		if !ok {
 			p.logger.Debug("forward: drop (alloc not registered)",
 				"alloc_id", peerAlloc, "src", srcAP.String())
 			continue
 		}
-		if _, err := p.udp.WriteToUDPAddrPort(buf[4:n], dst); err != nil {
+		if _, err := p.udp.WriteToUDPAddrPort(buf[4:n], entry.src); err != nil {
 			p.logger.Debug("forward: write to peer endpoint failed",
-				"alloc_id", peerAlloc, "dst", dst.String(), "err", err)
+				"alloc_id", peerAlloc, "dst", entry.src.String(), "err", err)
+		}
+	}
+}
+
+// gcLoop periodically evicts allocation entries whose lastSeen is
+// older than idleTTL. Runs until ctx cancels. Ticker period is
+// idleTTL/4 (capped at 5s minimum) so eviction granularity is well
+// under one TTL.
+func (p *Plane) gcLoop(ctx context.Context) {
+	interval := p.idleTTL / 4
+	if interval < time.Second {
+		interval = time.Second
+	}
+	if interval > 5*time.Second {
+		interval = 5 * time.Second
+	}
+	ticker := time.NewTicker(interval)
+	defer ticker.Stop()
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case now := <-ticker.C:
+			p.gcOnce(now)
+		}
+	}
+}
+
+// gcOnce evicts entries whose lastSeen is older than idleTTL relative
+// to now. Holds the write lock for the scan.
+func (p *Plane) gcOnce(now time.Time) {
+	cutoff := now.Add(-p.idleTTL).UnixNano()
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	for id, entry := range p.allocs {
+		if entry.lastSeen.Load() < cutoff {
+			delete(p.allocs, id)
+			delete(p.src2id, entry.src)
+			p.logger.Info("forward: allocation idle-timeout",
+				"alloc_id", id, "src", entry.src.String(),
+				"idle_s", int(now.Sub(time.Unix(0, entry.lastSeen.Load())).Seconds()))
 		}
 	}
 }
@@ -182,13 +275,32 @@ func (p *Plane) Run(ctx context.Context) error {
 // the agent presents in the registration packet; for the smoke
 // prototype the allocation id itself is treated as a capability.
 func (p *Plane) register(allocID uint32, src netip.AddrPort) {
+	now := time.Now().UnixNano()
 	p.mu.Lock()
 	prev, existed := p.allocs[allocID]
-	p.allocs[allocID] = src
+	var oldSrc netip.AddrPort
+	if existed {
+		// Re-registration from the same agent (or a new agent claiming
+		// the same id). Reuse the entry pointer so the lastSeen
+		// atomic isn't aliased between observers; rewrite src in-place
+		// and bump lastSeen.
+		oldSrc = prev.src
+		if oldSrc != src {
+			delete(p.src2id, oldSrc)
+		}
+		prev.src = src
+		prev.lastSeen.Store(now)
+		p.src2id[src] = allocID
+	} else {
+		entry := &allocEntry{src: src}
+		entry.lastSeen.Store(now)
+		p.allocs[allocID] = entry
+		p.src2id[src] = allocID
+	}
 	p.mu.Unlock()
-	if existed && prev != src {
+	if existed && oldSrc != src {
 		p.logger.Info("forward: allocation reclaimed",
-			"alloc_id", allocID, "old", prev.String(), "new", src.String())
+			"alloc_id", allocID, "old", oldSrc.String(), "new", src.String())
 	} else if !existed {
 		p.logger.Debug("forward: allocation registered",
 			"alloc_id", allocID, "src", src.String())

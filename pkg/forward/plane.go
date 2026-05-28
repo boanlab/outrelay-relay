@@ -93,8 +93,10 @@ func (p *Plane) Allocate() uint32 {
 		id := p.nextID.Add(1)
 		if id == 0 {
 			// Wraparound — skip reserved 0.
+			p.logger.Warn("forward: alloc id wraparound (skipping 0)")
 			continue
 		}
+		p.logger.Info("forward: allocation issued", "alloc_id", id)
 		return id
 	}
 }
@@ -104,8 +106,14 @@ func (p *Plane) Allocate() uint32 {
 // stream tears down.
 func (p *Plane) Forget(id uint32) {
 	p.mu.Lock()
+	_, existed := p.allocs[id]
 	delete(p.allocs, id)
 	p.mu.Unlock()
+	// `existed=false` after the first Forget is normal when the agent
+	// never sent its registration packet; a second Forget for the same
+	// id is a caller bug (double-release).
+	p.logger.Info("forward: allocation released",
+		"alloc_id", id, "was_registered", existed)
 }
 
 // Lookup returns the registered endpoint for an allocation id, if
@@ -135,12 +143,16 @@ func (p *Plane) Run(ctx context.Context) error {
 			return fmt.Errorf("forward: read: %w", err)
 		}
 		if n < 4 {
+			p.logger.Debug("forward: dropping short packet",
+				"src", srcAP.String(), "len", n)
 			continue
 		}
 		peerAlloc := binary.BigEndian.Uint32(buf[:4])
 		if peerAlloc == 0 {
 			// Registration: trailing payload is [my_alloc: u32 BE].
 			if n < 8 {
+				p.logger.Warn("forward: invalid registration packet",
+					"src", srcAP.String(), "len", n)
 				continue
 			}
 			myAlloc := binary.BigEndian.Uint32(buf[4:8])
@@ -152,9 +164,14 @@ func (p *Plane) Run(ctx context.Context) error {
 		dst, ok := p.allocs[peerAlloc]
 		p.mu.RUnlock()
 		if !ok {
+			p.logger.Debug("forward: drop (alloc not registered)",
+				"alloc_id", peerAlloc, "src", srcAP.String())
 			continue
 		}
-		_, _ = p.udp.WriteToUDPAddrPort(buf[4:n], dst)
+		if _, err := p.udp.WriteToUDPAddrPort(buf[4:n], dst); err != nil {
+			p.logger.Debug("forward: write to peer endpoint failed",
+				"alloc_id", peerAlloc, "dst", dst.String(), "err", err)
+		}
 	}
 }
 

@@ -66,7 +66,7 @@ type Plane struct {
 	logger *slog.Logger
 
 	mu     sync.RWMutex
-	allocs map[uint32]*allocEntry  // alloc_id -> entry
+	allocs map[uint32]*allocEntry    // alloc_id -> entry
 	src2id map[netip.AddrPort]uint32 // reverse index: agent src -> alloc id (for lastSeen bump)
 
 	nextID  atomic.Uint32
